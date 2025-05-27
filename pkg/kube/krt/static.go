@@ -19,7 +19,6 @@ import (
 	"sync"
 
 	"istio.io/istio/pkg/kube/controllers"
-	"istio.io/istio/pkg/kube/kclient"
 	"istio.io/istio/pkg/maps"
 	"istio.io/istio/pkg/ptr"
 	"istio.io/istio/pkg/slices"
@@ -37,6 +36,7 @@ type staticList[T any] struct {
 	stop           <-chan struct{}
 	collectionName string
 	syncer         Syncer
+	metadata       Metadata
 }
 
 func NewStaticCollection[T any](synced Syncer, vals []T, opts ...CollectionOption) StaticCollection[T] {
@@ -61,6 +61,10 @@ func NewStaticCollection[T any](synced Syncer, vals []T, opts ...CollectionOptio
 		stop:           o.stop,
 		collectionName: o.name,
 		syncer:         synced,
+	}
+
+	if o.metadata != nil {
+		sl.metadata = o.metadata
 	}
 
 	c := StaticCollection[T]{
@@ -100,6 +104,42 @@ func (s StaticCollection[T]) DeleteObjects(filter func(obj T) bool) {
 	}
 	if len(removed) > 0 {
 		s.eventHandlers.Distribute(removed, false)
+	}
+}
+
+func (s StaticCollection[T]) Reset(newState []T) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var updates []Event[T]
+	nv := map[string]T{}
+	for _, incoming := range newState {
+		k := GetKey(incoming)
+		nv[k] = incoming
+		if old, f := s.vals[k]; f {
+			if !equal(old, incoming) {
+				updates = append(updates, Event[T]{
+					Old:   &old,
+					New:   &incoming,
+					Event: controllers.EventUpdate,
+				})
+			}
+		} else {
+			updates = append(updates, Event[T]{
+				New:   &incoming,
+				Event: controllers.EventAdd,
+			})
+		}
+		delete(s.vals, k)
+	}
+	for _, remaining := range s.vals {
+		updates = append(updates, Event[T]{
+			Old:   &remaining,
+			Event: controllers.EventDelete,
+		})
+	}
+	s.vals = nv
+	if len(updates) > 0 {
+		s.eventHandlers.Distribute(updates, false)
 	}
 }
 
@@ -157,6 +197,10 @@ func (s *staticList[T]) GetKey(k string) *T {
 	return nil
 }
 
+func (s *staticList[T]) Metadata() Metadata {
+	return s.metadata
+}
+
 // nolint: unused // (not true, its to implement an interface)
 func (s *staticList[T]) name() string {
 	return s.collectionName
@@ -171,6 +215,7 @@ func (s *staticList[T]) uid() collectionUID {
 func (s *staticList[T]) dump() CollectionDump {
 	return CollectionDump{
 		Outputs: eraseMap(slices.GroupUnique(s.List(), getTypedKey)),
+		Synced:  s.HasSynced(),
 	}
 }
 
@@ -186,10 +231,11 @@ type staticListIndex[T any] struct {
 }
 
 // nolint: unused // (not true)
-func (s staticListIndex[T]) Lookup(key string) []any {
-	var res []any
+func (s staticListIndex[T]) Lookup(key string) []T {
+	var res []T
 	s.parent.mu.RLock()
 	defer s.parent.mu.RUnlock()
+
 	for _, v := range s.parent.vals {
 		have := s.extract(v)
 		if slices.Contains(have, key) {
@@ -200,7 +246,7 @@ func (s staticListIndex[T]) Lookup(key string) []any {
 }
 
 // nolint: unused // (not true, its to implement an interface)
-func (s *staticList[T]) index(extract func(o T) []string) kclient.RawIndexer {
+func (s *staticList[T]) index(name string, extract func(o T) []string) indexer[T] {
 	return staticListIndex[T]{
 		extract: extract,
 		parent:  s,

@@ -390,6 +390,9 @@ type PushRequest struct {
 	// Delta defines the resources that were added or removed as part of this push request.
 	// This is set only on requests from the client which change the set of resources they (un)subscribe from.
 	Delta ResourceDelta
+
+	// Forced defines that configs should be generated and pushed regardless if they have changed or not.
+	Forced bool
 }
 
 type ResourceDelta = xds.ResourceDelta
@@ -506,17 +509,18 @@ func (pr *PushRequest) Merge(other *PushRequest) *PushRequest {
 	// If either is full we need a full push
 	pr.Full = pr.Full || other.Full
 
+	// If either is forced we need a forced push
+	pr.Forced = pr.Forced || other.Forced
+
 	// The other push context is presumed to be later and more up to date
 	if other.Push != nil {
 		pr.Push = other.Push
 	}
-	// Do not merge when any one is empty
-	if len(pr.ConfigsUpdated) == 0 || len(other.ConfigsUpdated) == 0 {
-		pr.ConfigsUpdated = nil
+
+	if pr.ConfigsUpdated == nil {
+		pr.ConfigsUpdated = other.ConfigsUpdated
 	} else {
-		for conf := range other.ConfigsUpdated {
-			pr.ConfigsUpdated.Insert(conf)
-		}
+		pr.ConfigsUpdated.Merge(other.ConfigsUpdated)
 	}
 
 	if pr.AddressesUpdated == nil {
@@ -552,6 +556,9 @@ func (pr *PushRequest) CopyMerge(other *PushRequest) *PushRequest {
 		// If either is full we need a full push
 		Full: pr.Full || other.Full,
 
+		// If either is forced we need a forced push
+		Forced: pr.Forced || other.Forced,
+
 		// The other push context is presumed to be later and more up to date
 		Push: other.Push,
 
@@ -559,8 +566,9 @@ func (pr *PushRequest) CopyMerge(other *PushRequest) *PushRequest {
 		Reason: reason,
 	}
 
-	// Do not merge when any one is empty
-	if len(pr.ConfigsUpdated) > 0 && len(other.ConfigsUpdated) > 0 {
+	if pr.ConfigsUpdated == nil && other.ConfigsUpdated == nil {
+		merged.ConfigsUpdated = nil
+	} else {
 		merged.ConfigsUpdated = make(sets.Set[ConfigKey], len(pr.ConfigsUpdated)+len(other.ConfigsUpdated))
 		merged.ConfigsUpdated.Merge(pr.ConfigsUpdated)
 		merged.ConfigsUpdated.Merge(other.ConfigsUpdated)
@@ -972,16 +980,14 @@ func (ps *PushContext) extraServicesForProxy(proxy *Proxy, patches *MergedEnvoyF
 			addService(p.EnvoyExtAuthzGrpc.Service)
 		case *meshconfig.MeshConfig_ExtensionProvider_Zipkin:
 			addService(p.Zipkin.Service)
-		//nolint: staticcheck  // Lightstep deprecated
 		case *meshconfig.MeshConfig_ExtensionProvider_Lightstep:
-			addService(p.Lightstep.Service)
+			log.Warnf("Lightstep provider is deprecated, please use OpenTelemetry instead")
 		case *meshconfig.MeshConfig_ExtensionProvider_Datadog:
 			addService(p.Datadog.Service)
 		case *meshconfig.MeshConfig_ExtensionProvider_Skywalking:
 			addService(p.Skywalking.Service)
 		case *meshconfig.MeshConfig_ExtensionProvider_Opencensus:
-			//nolint: staticcheck
-			addService(p.Opencensus.Service)
+			log.Warnf("Opencensus provider is deprecated, please use OpenTelemetry instead")
 		case *meshconfig.MeshConfig_ExtensionProvider_Opentelemetry:
 			addService(p.Opentelemetry.Service)
 		case *meshconfig.MeshConfig_ExtensionProvider_EnvoyHttpAls:
@@ -1330,7 +1336,7 @@ func (ps *PushContext) InitContext(env *Environment, oldPushContext *PushContext
 	ps.initDefaultExportMaps()
 
 	// create new or incremental update
-	if pushReq == nil || oldPushContext == nil || !oldPushContext.InitDone.Load() || len(pushReq.ConfigsUpdated) == 0 {
+	if pushReq == nil || oldPushContext == nil || !oldPushContext.InitDone.Load() || pushReq.Forced {
 		ps.createNewContext(env)
 	} else {
 		ps.updateContext(env, oldPushContext, pushReq)
@@ -1371,11 +1377,13 @@ func (ps *PushContext) updateContext(
 	pushReq *PushRequest,
 ) {
 	var servicesChanged, virtualServicesChanged, destinationRulesChanged, gatewayChanged,
-		authnChanged, authzChanged, envoyFiltersChanged, sidecarsChanged, telemetryChanged, gatewayAPIChanged,
+		authnChanged, authzChanged, envoyFiltersChanged, sidecarsChanged, telemetryChanged,
 		wasmPluginsChanged, proxyConfigsChanged bool
 
 	changedEnvoyFilters := sets.New[ConfigKey]()
 
+	// We do not need to watch Ingress or Gateway API changes. Both of these have their own controllers which will send
+	// events for Istio types (Gateway and VirtualService).
 	for conf := range pushReq.ConfigsUpdated {
 		switch conf.Kind {
 		case kind.ServiceEntry, kind.DNSName:
@@ -1398,11 +1406,6 @@ func (ps *PushContext) updateContext(
 		case kind.RequestAuthentication,
 			kind.PeerAuthentication:
 			authnChanged = true
-		case kind.HTTPRoute, kind.TCPRoute, kind.TLSRoute, kind.GRPCRoute, kind.GatewayClass, kind.KubernetesGateway, kind.ReferenceGrant:
-			gatewayAPIChanged = true
-			// VS and GW are derived from gatewayAPI, so if it changed we need to update those as well
-			virtualServicesChanged = true
-			gatewayChanged = true
 		case kind.Telemetry:
 			telemetryChanged = true
 		case kind.ProxyConfig:
@@ -1419,9 +1422,11 @@ func (ps *PushContext) updateContext(
 		ps.serviceAccounts = oldPushContext.serviceAccounts
 	}
 
-	if servicesChanged || gatewayAPIChanged {
+	if servicesChanged {
 		// Gateway status depends on services, so recompute if they change as well
 		ps.initKubernetesGateways(env)
+	} else {
+		ps.GatewayAPIController = oldPushContext.GatewayAPIController
 	}
 
 	if virtualServicesChanged {
@@ -2322,11 +2327,6 @@ func (ps *PushContext) EnvoyFilters(proxy *Proxy) *MergedEnvoyFilterWrapper {
 func (ps *PushContext) getMatchedEnvoyFilters(proxy *Proxy, namespaces string) []*EnvoyFilterWrapper {
 	matchedEnvoyFilters := make([]*EnvoyFilterWrapper, 0)
 	for _, efw := range ps.envoyFiltersByNamespace[namespaces] {
-		if efw.GetTargetRefs() != nil {
-			// These are meant for a specific target, so we shouldn't treat these as "always match"
-			// In the future, targetRef for EnvoyFilter will likely be implemented -- but currently these would never match
-			continue
-		}
 		if efw.workloadSelector == nil || efw.workloadSelector.SubsetOf(proxy.Labels) {
 			matchedEnvoyFilters = append(matchedEnvoyFilters, efw)
 		}

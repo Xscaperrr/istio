@@ -289,17 +289,12 @@ func NewController(kubeClient kubelib.Client, options Options) *Controller {
 			SystemNamespace: options.SystemNamespace,
 			DomainSuffix:    options.DomainSuffix,
 			ClusterID:       options.ClusterID,
+			IsConfigCluster: options.ConfigCluster,
 			Revision:        options.Revision,
 			XDSUpdater:      options.XDSUpdater,
 			MeshConfig:      options.MeshWatcher,
-			LookupNetwork:   c.Network,
-			LookupNetworkGateways: func() []model.NetworkGateway {
-				return slices.Filter(c.NetworkGateways(), func(g model.NetworkGateway) bool {
-					return g.HBONEPort != 0
-				})
-			},
-			StatusNotifier: options.StatusWritingEnabled,
-			Debugger:       options.KrtDebugger,
+			StatusNotifier:  options.StatusWritingEnabled,
+			Debugger:        options.KrtDebugger,
 			Flags: ambient.FeatureFlags{
 				DefaultAllowFromWaypoint:              features.DefaultAllowFromWaypoint,
 				EnableK8SServiceSelectWorkloadEntries: features.EnableK8SServiceSelectWorkloadEntries,
@@ -421,7 +416,7 @@ func (c *Controller) deleteService(svc *model.Service) {
 		c.NotifyGatewayHandlers()
 		// TODO trigger push via handler
 		// networks are different, we need to update all eds endpoints
-		c.opts.XDSUpdater.ConfigUpdate(&model.PushRequest{Full: true, Reason: model.NewReasonStats(model.NetworksTrigger)})
+		c.opts.XDSUpdater.ConfigUpdate(&model.PushRequest{Full: true, Reason: model.NewReasonStats(model.NetworksTrigger), Forced: true})
 	}
 
 	shard := model.ShardKeyFromRegistry(c)
@@ -493,7 +488,7 @@ func (c *Controller) addOrUpdateService(pre, curr *v1.Service, currConv *model.S
 	// as that full push is only triggered for the specific service.
 	if needsFullPush {
 		// networks are different, we need to update all eds endpoints
-		c.opts.XDSUpdater.ConfigUpdate(&model.PushRequest{Full: true, Reason: model.NewReasonStats(model.NetworksTrigger)})
+		c.opts.XDSUpdater.ConfigUpdate(&model.PushRequest{Full: true, Reason: model.NewReasonStats(model.NetworksTrigger), Forced: true})
 	}
 
 	shard := model.ShardKeyFromRegistry(c)
@@ -559,6 +554,7 @@ func (c *Controller) onNodeEvent(_, node *v1.Node, event model.Event) error {
 		c.opts.XDSUpdater.ConfigUpdate(&model.PushRequest{
 			Full:   true,
 			Reason: model.NewReasonStats(model.ServiceUpdate),
+			Forced: true,
 		})
 	}
 	return nil

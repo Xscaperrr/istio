@@ -38,6 +38,7 @@ import (
 	"istio.io/istio/pilot/pkg/util/protoconv"
 	xdsfilters "istio.io/istio/pilot/pkg/xds/filters"
 	"istio.io/istio/pilot/pkg/xds/requestidextension"
+	"istio.io/istio/pkg/env"
 	"istio.io/istio/pkg/log"
 	"istio.io/istio/pkg/wellknown"
 )
@@ -151,6 +152,9 @@ func configureFromProviderConfig(pushCtx *model.PushContext, proxy *model.Proxy,
 	providerCfg *meshconfig.MeshConfig_ExtensionProvider,
 ) (*hcm.HttpConnectionManager_Tracing, bool, error) {
 	startChildSpan := false
+	if proxy.Type == model.Router {
+		startChildSpan = features.SpawnUpstreamSpanForGateway
+	}
 	useCustomSampler := false
 	var serviceCluster string
 	var maxTagLength uint32
@@ -183,18 +187,7 @@ func configureFromProviderConfig(pushCtx *model.PushContext, proxy *model.Proxy,
 			return datadogConfig(serviceCluster, hostname, cluster)
 		}
 	case *meshconfig.MeshConfig_ExtensionProvider_Lightstep:
-		//nolint: staticcheck  // Lightstep deprecated
-		maxTagLength = provider.Lightstep.GetMaxTagLength()
-		providerName = envoyOpenTelemetry
-		//nolint: staticcheck  // Lightstep deprecated
-		providerConfig = func() (*anypb.Any, error) {
-			hostname, clusterName, err := clusterLookupFn(pushCtx, provider.Lightstep.GetService(), int(provider.Lightstep.GetPort()))
-			if err != nil {
-				model.IncLookupClusterFailures("lightstep")
-				return nil, fmt.Errorf("could not find cluster for tracing provider %q: %v", provider, err)
-			}
-			return otelLightStepConfig(clusterName, hostname, provider.Lightstep.GetAccessToken())
-		}
+		log.Warnf("Lightstep provider is deprecated, please use OpenTelemetry instead")
 	case *meshconfig.MeshConfig_ExtensionProvider_Skywalking:
 		maxTagLength = 0
 		providerName = envoySkywalking
@@ -350,26 +343,6 @@ func skywalkingConfig(clusterName, hostname string) (*anypb.Any, error) {
 	}
 
 	return protoconv.MessageToAnyWithError(s)
-}
-
-func otelLightStepConfig(clusterName, hostname, accessToken string) (*anypb.Any, error) {
-	dc := &tracingcfg.OpenTelemetryConfig{
-		GrpcService: &core.GrpcService{
-			TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
-				EnvoyGrpc: &core.GrpcService_EnvoyGrpc{
-					ClusterName: clusterName,
-					Authority:   hostname,
-				},
-			},
-			InitialMetadata: []*core.HeaderValue{
-				{
-					Key:   "lightstep-access-token",
-					Value: accessToken,
-				},
-			},
-		},
-	}
-	return anypb.New(dc)
 }
 
 func configureDynatraceSampler(hostname, cluster string,
@@ -728,7 +701,7 @@ func buildHTTPHeaders(headers []*meshconfig.MeshConfig_ExtensionProvider_HttpHea
 			AppendAction: core.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,
 			Header: &core.HeaderValue{
 				Key:   h.GetName(),
-				Value: h.GetValue(),
+				Value: getHeaderValue(h),
 			},
 		}
 		target = append(target, hvo)
@@ -744,9 +717,19 @@ func buildInitialMetadata(metadata []*meshconfig.MeshConfig_ExtensionProvider_Ht
 	for _, h := range metadata {
 		hv := &core.HeaderValue{
 			Key:   h.GetName(),
-			Value: h.GetValue(),
+			Value: getHeaderValue(h),
 		}
 		target = append(target, hv)
 	}
 	return target
+}
+
+func getHeaderValue(header *meshconfig.MeshConfig_ExtensionProvider_HttpHeader) string {
+	switch hv := header.HeaderValue.(type) {
+	case *meshconfig.MeshConfig_ExtensionProvider_HttpHeader_Value:
+		return hv.Value
+	case *meshconfig.MeshConfig_ExtensionProvider_HttpHeader_EnvName:
+		return env.Register[string](hv.EnvName, "", "").Get()
+	}
+	return ""
 }

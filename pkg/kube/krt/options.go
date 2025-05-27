@@ -22,7 +22,10 @@ type OptionsBuilder struct {
 	namePrefix string
 	stop       <-chan struct{}
 	debugger   *DebugHandler
+	metadata   Metadata
 }
+
+type BuilderOption func(opt CollectionOption) OptionsBuilder
 
 func NewOptionsBuilder(stop <-chan struct{}, namePrefix string, debugger *DebugHandler) OptionsBuilder {
 	return OptionsBuilder{
@@ -38,12 +41,17 @@ func (k OptionsBuilder) WithName(n string) []CollectionOption {
 	if k.namePrefix != "" {
 		name = k.namePrefix + "/" + name
 	}
-	return []CollectionOption{WithDebugging(k.debugger), WithStop(k.stop), WithName(name)}
+	return []CollectionOption{WithDebugging(k.debugger), WithStop(k.stop), WithName(name), WithMetadata(k.metadata)}
+}
+
+func (k OptionsBuilder) WithMetadata(m Metadata) OptionsBuilder {
+	k.metadata = m
+	return k
 }
 
 // With applies arbitrary options along with the base options.
 func (k OptionsBuilder) With(opts ...CollectionOption) []CollectionOption {
-	return append([]CollectionOption{WithDebugging(k.debugger), WithStop(k.stop)}, opts...)
+	return append([]CollectionOption{WithDebugging(k.debugger), WithStop(k.stop), WithMetadata(k.metadata)}, opts...)
 }
 
 func (k OptionsBuilder) Stop() <-chan struct{} {
@@ -88,5 +96,22 @@ func WithStop(stop <-chan struct{}) CollectionOption {
 func WithDebugging(handler *DebugHandler) CollectionOption {
 	return func(c *collectionOptions) {
 		c.debugger = handler
+	}
+}
+
+// WithJoinUnchecked enables an optimization for join collections, where keys are not deduplicated across collections.
+// This option can only be used when joined collections are disjoint: keys overlapping between collections is undefined behavior
+func WithJoinUnchecked() CollectionOption {
+	return func(c *collectionOptions) {
+		c.joinUnchecked = true
+	}
+}
+
+// WithMetadata adds metadata to the collection. This is mainly useful
+// for creating collections of collections where the metadata is needed to
+// fetch a specific collection.
+func WithMetadata(metadata Metadata) CollectionOption {
+	return func(c *collectionOptions) {
+		c.metadata = metadata
 	}
 }
