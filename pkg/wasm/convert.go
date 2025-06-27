@@ -242,15 +242,6 @@ func convertWasmConfigFromRemoteToLocal(ec *core.TypedExtensionConfig, wasmHTTPF
 		return nil, fmt.Errorf("cannot fetch Wasm module %v: %w", remote.GetHttpUri().GetUri(), err)
 	}
 
-	// Added by Ingress
-	// Check for wamr-aot custom section
-	hasWamrAotSection := containsWamrAotInCustomSection(f)
-	if hasWamrAotSection {
-		vm.Runtime = wamrRuntime
-		vm.AllowPrecompiled = true
-	}
-	// End added by Ingress
-
 	// Rewrite remote fetch to local file.
 	vm.Code = &core.AsyncDataSource{
 		Specifier: &core.AsyncDataSource_Local{
