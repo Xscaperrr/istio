@@ -31,6 +31,7 @@ import (
 	meshconfig "istio.io/api/mesh/v1alpha1"
 	networking "istio.io/api/networking/v1alpha3"
 	"istio.io/istio/pilot/pkg/features"
+	alifeatures "istio.io/istio/pkg/ali/features"
 	"istio.io/istio/pkg/cluster"
 	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/constants"
@@ -108,6 +109,10 @@ type virtualServiceIndex struct {
 
 	// Map of VS hostname -> referenced hostnames
 	referencedDestinations map[string]sets.String
+
+	// Added by ingress
+	byHost map[string][]config.Config
+	// End added by ingress
 }
 
 func newVirtualServiceIndex() virtualServiceIndex {
@@ -117,6 +122,9 @@ func newVirtualServiceIndex() virtualServiceIndex {
 		exportedToNamespaceByGateway: map[types.NamespacedName][]config.Config{},
 		delegates:                    map[ConfigKey][]ConfigKey{},
 		referencedDestinations:       map[string]sets.String{},
+		// Added by ingress
+		byHost: map[string][]config.Config{},
+		// End added by ingress
 	}
 	if features.FilterGatewayClusterConfig {
 		out.destinationsByGateway = make(map[string]sets.String)
@@ -775,6 +783,11 @@ func virtualServiceDestinations(v *networking.VirtualService) map[string]sets.Se
 			if r.Destination != nil {
 				addDestination(r.Destination.Host, r.Destination.GetPort())
 			}
+			// Added by ingress
+			// Support for fallback cluster
+			for _, fallback := range r.FallbackClusters {
+				addDestination(fallback.Host, fallback.GetPort())
+			}
 		}
 		if h.Mirror != nil {
 			addDestination(h.Mirror.Host, h.Mirror.GetPort())
@@ -809,9 +822,19 @@ func (ps *PushContext) GatewayServices(proxy *Proxy) []*Service {
 	}
 
 	// host set.
-	hostsFromGateways := sets.String{}
+	hostsFromGateways := sets.New[string]()
 	for _, gw := range proxy.MergedGateway.GatewayNameForServer {
-		hostsFromGateways.Merge(ps.virtualServiceIndex.destinationsByGateway[gw])
+		for _, vsConfig := range ps.VirtualServicesForGateway(proxy.ConfigNamespace, gw) {
+			vs, ok := vsConfig.Spec.(*networking.VirtualService)
+			if !ok { // should never happen
+				log.Errorf("Failed in getting a virtual service: %v", vsConfig.Labels)
+				return svcs
+			}
+
+			for host := range virtualServiceDestinations(vs) {
+				hostsFromGateways.Insert(host)
+			}
+		}
 	}
 	log.Debugf("GatewayServices: gateway %v is exposing these hosts:%v", proxy.ID, hostsFromGateways)
 
@@ -819,6 +842,15 @@ func (ps *PushContext) GatewayServices(proxy *Proxy) []*Service {
 
 	for _, s := range svcs {
 		svcHost := string(s.Hostname)
+
+		// Added by ingress
+		if alifeatures.EnablePushAllMcpClusters {
+			if s.Attributes.Namespace == "mcp" {
+				gwSvcs = append(gwSvcs, s)
+				continue
+			}
+		}
+		// End added by ingress
 
 		if _, ok := hostsFromGateways[svcHost]; ok {
 			gwSvcs = append(gwSvcs, s)
@@ -1557,6 +1589,10 @@ func (ps *PushContext) initVirtualServices(env *Environment) {
 		vservices[i] = virtualServices[i].DeepCopy()
 	}
 
+	// Added by ingress
+	vservices = VirtualServiceFilter(vservices)
+	// End added by ingress
+
 	totalVirtualServices.Record(float64(len(virtualServices)))
 
 	// TODO(rshriram): parse each virtual service and maintain a map of the
@@ -1575,6 +1611,17 @@ func (ps *PushContext) initVirtualServices(env *Environment) {
 	for _, virtualService := range vservices {
 		ns := virtualService.Namespace
 		rule := virtualService.Spec.(*networking.VirtualService)
+		// Added by ingress
+		if len(rule.Gateways) > 0 {
+			if len(rule.Hosts) == 0 {
+				ps.virtualServiceIndex.byHost[constants.GlobalWildcardHost] = append(ps.virtualServiceIndex.byHost[constants.GlobalWildcardHost], virtualService)
+			} else {
+				for _, host := range rule.Hosts {
+					ps.virtualServiceIndex.byHost[host] = append(ps.virtualServiceIndex.byHost[host], virtualService)
+				}
+			}
+		}
+		// End added by ingress
 		gwNames := getGatewayNames(rule)
 		if len(rule.ExportTo) == 0 {
 			// No exportTo in virtualService. Use the global default
@@ -1753,6 +1800,10 @@ func (ps *PushContext) initDestinationRules(env *Environment) {
 	for i := range destRules {
 		destRules[i] = configs[i]
 	}
+
+	// Add by ingress
+	destRules = DestinationFilter(destRules)
+	// End Add by ingress
 
 	ps.setDestinationRules(destRules)
 }
@@ -2065,6 +2116,17 @@ func (ps *PushContext) HasEnvoyFilters(name, namespace string) bool {
 func (ps *PushContext) initGateways(env *Environment) {
 	gatewayConfigs := env.List(gvk.Gateway, NamespaceAll)
 
+	// Added by ingress
+	// values returned from ConfigStore.List are immutable.
+	// Therefore, we make a copy
+	gateways := make([]config.Config, len(gatewayConfigs))
+
+	for i := range gateways {
+		gateways[i] = gatewayConfigs[i].DeepCopy()
+	}
+	gatewayConfigs = GatewayFilter(gateways)
+	// End added by ingress
+
 	sortConfigByCreationTime(gatewayConfigs)
 
 	if features.ScopeGatewayToNamespace {
@@ -2274,3 +2336,10 @@ func (ps *PushContext) WaypointsFor(scope WaypointScope) []netip.Addr {
 func (ps *PushContext) WorkloadsForWaypoint(scope WaypointScope) []*WorkloadInfo {
 	return ps.ambientIndex.WorkloadsForWaypoint(scope)
 }
+
+// Added by ingress
+func (ps *PushContext) VirtualServicesForHost(proxy *Proxy, host string) []config.Config {
+	return ps.virtualServiceIndex.byHost[host]
+}
+
+// End added by ingress

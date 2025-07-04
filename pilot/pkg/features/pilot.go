@@ -38,7 +38,7 @@ var (
 	// MaxRecvMsgSize The max receive buffer size of gRPC received channel of Pilot in bytes.
 	MaxRecvMsgSize = env.Register(
 		"ISTIO_GPRC_MAXRECVMSGSIZE",
-		4*1024*1024,
+		100*1024*1024,
 		"Sets the max receive buffer size of gRPC stream in bytes.",
 	).Get()
 
@@ -365,6 +365,9 @@ var (
 	EnableUnsafeAdminEndpoints = env.Register("UNSAFE_ENABLE_ADMIN_ENDPOINTS", false,
 		"If this is set to true, dangerous admin endpoints will be exposed on the debug interface. Not recommended for production.").Get()
 
+	DebugAuth = env.RegisterBoolVar("DEBUG_AUTH", true,
+		"If this is set to false, the debug interface will allow all anonymous request from any remote host, which is not recommended for production").Get()
+
 	XDSAuth = env.Register("XDS_AUTH", true,
 		"If true, will authenticate XDS clients.").Get()
 
@@ -442,6 +445,11 @@ var (
 	// so that in case there are issues with the CDS cache we can just disable the CDS cache.
 	EnableCDSCaching = env.Register("PILOT_ENABLE_CDS_CACHE", true,
 		"If true, Pilot will cache CDS responses. Note: this depends on PILOT_ENABLE_XDS_CACHE.").Get()
+
+	// EnableLDSCaching determines if LDS caching is enabled. This is explicitly split out of ENABLE_XDS_CACHE,
+	// so that in case there are issues with the LDS cache we can just disable the LDS cache.
+	EnableLDSCaching = env.Register("PILOT_ENABLE_LDS_CACHE", false,
+		"If true, Pilot will cache LDS responses. Note: this depends on PILOT_ENABLE_XDS_CACHE.").Get()
 
 	// EnableRDSCaching determines if RDS caching is enabled. This is explicitly split out of ENABLE_XDS_CACHE,
 	// so that in case there are issues with the RDS cache we can just disable the RDS cache.
@@ -684,7 +692,20 @@ var (
 	// Also see https://github.com/istio/istio/issues/46719 why this flag is required
 	EnableAdditionalIpv4OutboundListenerForIpv6Only = env.RegisterBoolVar("ISTIO_ENABLE_IPV4_OUTBOUND_LISTENER_FOR_IPV6_CLUSTERS", false,
 		"If true, pilot will configure an additional IPv4 listener for outbound traffic in IPv6 only clusters, e.g. AWS EKS IPv6 only clusters.").Get()
+
+	enableEndpointSliceController, endpointSliceControllerSpecified = env.RegisterBoolVar(
+		"PILOT_USE_ENDPOINT_SLICE",
+		false,
+		"If enabled, Pilot will use EndpointSlices as the source of endpoints for Kubernetes services. "+
+			"By default, this is false, and Endpoints will be used. This requires the Kubernetes EndpointSlice controller to be enabled. "+
+			"Currently this is mutual exclusive - either Endpoints or EndpointSlices will be used",
+	).Lookup()
 )
+
+// EnableEndpointSliceController returns the value of the feature flag and whether it was actually specified.
+func EnableEndpointSliceController() (value bool, ok bool) {
+	return enableEndpointSliceController, endpointSliceControllerSpecified
+}
 
 // UnsafeFeaturesEnabled returns true if any unsafe features are enabled.
 func UnsafeFeaturesEnabled() bool {

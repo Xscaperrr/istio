@@ -15,6 +15,9 @@
 package controller
 
 import (
+	"fmt"
+	"os"
+
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -23,6 +26,7 @@ import (
 	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/keycertbundle"
 	"istio.io/istio/pilot/pkg/model"
+	alifeatures "istio.io/istio/pkg/ali/features"
 	"istio.io/istio/pkg/kube"
 	"istio.io/istio/pkg/kube/controllers"
 	"istio.io/istio/pkg/kube/inject"
@@ -43,7 +47,25 @@ const (
 	maxRetries = 5
 )
 
-var configMapLabel = map[string]string{"istio.io/config": "true"}
+var (
+	configMapLabel = map[string]string{"istio.io/config": "true"}
+
+	// Added by ingress
+	dynamicCACertNamespaceConfigMap = CACertNamespaceConfigMap
+	// End added by ingres
+)
+
+// Added by ingress
+func init() {
+	if features.ClusterName != "" && features.ClusterName != "Kubernetes" {
+		dynamicCACertNamespaceConfigMap = fmt.Sprintf("%s-ca-root-cert", features.ClusterName)
+	}
+	if alifeatures.CustomCACertConfigMapName != "" {
+		dynamicCACertNamespaceConfigMap = alifeatures.CustomCACertConfigMapName
+	}
+}
+
+// End added by ingress
 
 // NamespaceController manages reconciles a configmap in each namespace with a desired set of data.
 type NamespaceController struct {
@@ -70,13 +92,20 @@ func NewNamespaceController(kubeClient kube.Client, caBundleWatcher *keycertbund
 		controllers.WithReconciler(c.reconcileCACert),
 		controllers.WithMaxAttempts(maxRetries))
 
+	// updated by ingress
 	c.configmaps = kclient.NewFiltered[*v1.ConfigMap](kubeClient, kclient.Filter{
-		FieldSelector: "metadata.name=" + CACertNamespaceConfigMap,
+		FieldSelector: "metadata.name=" + dynamicCACertNamespaceConfigMap,
 		ObjectFilter:  c.GetFilter(),
 	})
+
 	c.namespaces = kclient.New[*v1.Namespace](kubeClient)
 
 	c.configmaps.AddEventHandler(controllers.FilteredObjectSpecHandler(c.queue.AddObject, func(o controllers.Object) bool {
+		// Add by ingress
+		if o.GetNamespace() != podNs {
+			return false
+		}
+		// End add by ingress
 		// skip special kubernetes system namespaces
 		return !inject.IgnoredNamespaces.Contains(o.GetNamespace())
 	}))
@@ -87,6 +116,17 @@ func NewNamespaceController(kubeClient kube.Client, caBundleWatcher *keycertbund
 		})
 	} else {
 		c.namespaces.AddEventHandler(controllers.FilteredObjectSpecHandler(c.queue.AddObject, func(o controllers.Object) bool {
+			// Add by ingress
+			if alifeatures.WatchResourcesByNamespaceForPrimaryCluster != "" {
+				if o.GetName() != alifeatures.WatchResourcesByNamespaceForPrimaryCluster {
+					// This is a change to a namespace we don't watch, ignore it
+					return false
+				}
+			}
+			if o.GetName() != podNs {
+				return false
+			}
+			// End add by ingress
 			if features.InformerWatchNamespace != "" && features.InformerWatchNamespace != o.GetName() {
 				// We are only watching one namespace, and its not this one
 				return false
@@ -150,16 +190,23 @@ func (nc *NamespaceController) reconcileCACert(o types.NamespacedName) error {
 	}
 
 	meta := metav1.ObjectMeta{
-		Name:      CACertNamespaceConfigMap,
+		Name:      dynamicCACertNamespaceConfigMap,
 		Namespace: ns,
 		Labels:    configMapLabel,
 	}
 	return k8s.InsertDataToConfigMap(nc.configmaps, meta, nc.caBundleWatcher.GetCABundle())
 }
 
+var podNs = os.Getenv("POD_NAMESPACE")
+
 // On namespace change, update the config map.
 // If terminating, this will be skipped
 func (nc *NamespaceController) namespaceChange(ns *v1.Namespace) {
+	// Added by ingress
+	if ns.Name != podNs {
+		return
+	}
+	// End added by ingress
 	if ns.Status.Phase != v1.NamespaceTerminating {
 		nc.syncNamespace(ns.Name)
 	}
@@ -170,5 +217,19 @@ func (nc *NamespaceController) syncNamespace(ns string) {
 	if inject.IgnoredNamespaces.Contains(ns) {
 		return
 	}
+
+	// Add by ingress
+	if alifeatures.WatchResourcesByNamespaceForPrimaryCluster != "" {
+		if ns != alifeatures.WatchResourcesByNamespaceForPrimaryCluster {
+			// This is a change to a namespace we don't watch, ignore it
+			return
+		}
+	}
+
+	if ns != podNs {
+		return
+	}
+	// End add by ingress
+
 	nc.queue.Add(types.NamespacedName{Name: ns})
 }

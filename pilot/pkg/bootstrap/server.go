@@ -34,6 +34,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/reflection"
+	kubecontroller "istio.io/istio/pilot/pkg/serviceregistry/kube/controller"
 	"k8s.io/client-go/rest"
 
 	"istio.io/api/security/v1beta1"
@@ -257,6 +258,9 @@ func NewServer(args *PilotArgs, initFuncs ...func(*Server)) (*Server, error) {
 		return nil, fmt.Errorf("error initializing kube client: %v", err)
 	}
 
+	// used for both initKubeRegistry and initClusterRegistries
+	args.RegistryOptions.KubeOptions.EndpointMode = kubecontroller.DetectEndpointMode(s.kubeClient)
+
 	s.initMeshConfiguration(args, s.fileWatcher)
 	spiffe.SetTrustDomain(s.environment.Mesh().GetTrustDomain())
 
@@ -378,7 +382,6 @@ func NewServer(args *PilotArgs, initFuncs ...func(*Server)) (*Server, error) {
 			return nil
 		})
 	}
-
 	return s, nil
 }
 
@@ -545,6 +548,7 @@ func (s *Server) initKubeClient(args *PilotArgs) error {
 		}
 
 		s.kubeClient, err = kubelib.NewClient(kubelib.NewClientConfigForRestConfig(kubeRestConfig), args.RegistryOptions.KubeOptions.ClusterID)
+
 		if err != nil {
 			return fmt.Errorf("failed creating kube client: %v", err)
 		}
@@ -854,6 +858,7 @@ func (s *Server) initRegistryEventHandlers() {
 				ConfigsUpdated: sets.New(model.ConfigKey{Kind: kind.ServiceEntry, Name: string(curr.Hostname), Namespace: curr.Attributes.Namespace}),
 				Reason:         model.NewReasonStats(model.ServiceUpdate),
 			}
+			log.Infof("PushRequest generated in serviceHandler: %#v", pushReq)
 			s.XDSServer.ConfigUpdate(pushReq)
 		}
 	}
@@ -879,6 +884,7 @@ func (s *Server) initRegistryEventHandlers() {
 				ConfigsUpdated: sets.New(model.ConfigKey{Kind: kind.MustFromGVK(curr.GroupVersionKind), Name: curr.Name, Namespace: curr.Namespace}),
 				Reason:         model.NewReasonStats(model.ConfigUpdate),
 			}
+			log.Infof("PushRequest generated in configHandler: %#v", pushReq)
 			s.XDSServer.ConfigUpdate(pushReq)
 		}
 		schemas := collections.Pilot.All()

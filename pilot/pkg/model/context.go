@@ -27,6 +27,7 @@ import (
 	"time"
 
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	listener "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 	anypb "google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/structpb"
@@ -118,6 +119,10 @@ type Environment struct {
 
 	// Cache for XDS resources.
 	Cache XdsCache
+
+	// Added by ingress
+	IngressStore IngressStore
+	// End added by ingress
 }
 
 func (e *Environment) Mesh() *meshconfig.MeshConfig {
@@ -380,6 +385,10 @@ type Proxy struct {
 	// LastPushContext; the XDS cache depends on knowing the time of the PushContext to determine if a
 	// key is stale or not.
 	LastPushTime time.Time
+
+	// Added by Higress
+	CachedListeners []*listener.Listener
+	// End added by Higress
 }
 
 // WatchedResource tracks an active DiscoveryRequest subscription.
@@ -724,6 +733,10 @@ type NodeMetadata struct {
 // if not present.
 func (m NodeMetadata) ProxyConfigOrDefault(def *meshconfig.ProxyConfig) *meshconfig.ProxyConfig {
 	if m.ProxyConfig != nil {
+		// Added by ingress
+		mergeProxyConfigWhenNeeded((*meshconfig.ProxyConfig)(m.ProxyConfig), def)
+		// End added by ingress
+
 		return (*meshconfig.ProxyConfig)(m.ProxyConfig)
 	}
 	return def

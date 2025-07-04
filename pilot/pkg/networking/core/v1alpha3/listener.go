@@ -19,6 +19,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	listener "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
@@ -89,13 +90,19 @@ var (
 	allIstioMtlsALPNs = []string{"istio", "istio-peer-exchange", "istio-http/1.0", "istio-http/1.1", "istio-h2"}
 
 	mtlsTCPWithMxcALPNs = []string{"istio-peer-exchange", "istio"}
+
+	defaultGatewayTransportSocketConnectTimeout = 15 * time.Second
 )
 
+// Modified by Higress
 // BuildListeners produces a list of listeners and referenced clusters for all proxies
 func (configgen *ConfigGeneratorImpl) BuildListeners(node *model.Proxy,
-	push *model.PushContext,
-) []*listener.Listener {
-	builder := NewListenerBuilder(node, push)
+	req *model.PushRequest,
+) ([]*listener.Listener, model.XdsLogDetails) {
+	builder := NewListenerBuilder(node, req.Push)
+	cacheStats := cacheStats{}
+	efw := req.Push.EnvoyFilters(node)
+	efKeys := efw.Keys()
 
 	switch node.Type {
 	case model.SidecarProxy:
@@ -103,20 +110,42 @@ func (configgen *ConfigGeneratorImpl) BuildListeners(node *model.Proxy,
 	case model.Waypoint:
 		builder = configgen.buildWaypointListeners(builder)
 	case model.Router:
-		builder = configgen.buildGatewayListeners(builder)
+		builder, cacheStats = configgen.buildGatewayListeners(builder, req, efKeys)
 	}
 
-	builder.patchListeners()
-	l := builder.getListeners()
-	if builder.node.EnableHBONE() && !builder.node.IsAmbient() {
-		l = append(l, buildConnectOriginateListener())
+	var l []*listener.Listener
+	// Because the EnvoyFilter still needs to be patched before the final LDS data is generated,
+	// it is determined here that as long as all LDS caches are hit, the cached listeners will be
+	// used to avoid repeatedly patching the EnvoyFilter.
+	var useCached bool
+	if !cacheStats.empty() && cacheStats.miss == 0 {
+		node.RLock()
+		if len(node.CachedListeners) > 0 {
+			l = node.CachedListeners
+			useCached = true
+			log.Debugf("node %s use cached listeners: %+v", node.ID, node.CachedListeners)
+		}
+		node.RUnlock()
 	}
-
-	return l
+	if !useCached {
+		builder.patchListeners()
+		l = builder.getListeners()
+		if builder.node.EnableHBONE() && !builder.node.IsAmbient() {
+			l = append(l, buildConnectOriginateListener())
+		}
+		node.Lock()
+		node.CachedListeners = l
+		log.Debugf("node %s cached listeners: %+v", node.ID, node.CachedListeners)
+		node.Unlock()
+	}
+	return l, model.XdsLogDetails{AdditionalInfo: fmt.Sprintf("cached:%v/%v", cacheStats.hits, cacheStats.hits+cacheStats.miss)}
 }
+
+// End modified by Higress
 
 func BuildListenerTLSContext(serverTLSSettings *networking.ServerTLSSettings,
 	proxy *model.Proxy, mesh *meshconfig.MeshConfig, transportProtocol istionetworking.TransportProtocol, gatewayTCPServerWithTerminatingTLS bool,
+	extraOpts *buildListenerFilterChainExtraOpts,
 ) *auth.DownstreamTlsContext {
 	alpnByTransport := util.ALPNHttp
 	if transportProtocol == istionetworking.TransportProtocolQUIC {
@@ -125,6 +154,8 @@ func BuildListenerTLSContext(serverTLSSettings *networking.ServerTLSSettings,
 		serverTLSSettings.Mode == networking.ServerTLSSettings_ISTIO_MUTUAL &&
 		gatewayTCPServerWithTerminatingTLS {
 		alpnByTransport = util.ALPNDownstreamWithMxc
+	} else if shouldDisableH2(extraOpts) {
+		alpnByTransport = util.ALPNH11Only
 	}
 
 	ctx := &auth.DownstreamTlsContext{
@@ -167,11 +198,18 @@ func BuildListenerTLSContext(serverTLSSettings *networking.ServerTLSSettings,
 		authnmodel.ApplyToCommonTLSContext(ctx.CommonTlsContext, certProxy, serverTLSSettings.SubjectAltNames, []string{}, validateClient)
 	}
 
-	if isSimpleOrMutual(serverTLSSettings.Mode) {
-		// If Mesh TLSDefaults are set, use them.
-		applyDownstreamTLSDefaults(mesh.GetTlsDefaults(), ctx.CommonTlsContext)
-		applyServerTLSSettings(serverTLSSettings, ctx.CommonTlsContext)
-	}
+	// Delete by ingress
+	//if isSimpleOrMutual(serverTLSSettings.Mode) {
+	//	// If Mesh TLSDefaults are set, use them.
+	//	applyDownstreamTLSDefaults(mesh.GetTlsDefaults(), ctx.CommonTlsContext)
+	//	applyServerTLSSettings(serverTLSSettings, ctx.CommonTlsContext)
+	//}
+	// End deleted by ingress
+
+	// Add by ingress
+	ctx.CommonTlsContext.TlsParams = applyTls(serverTLSSettings, extraOpts)
+	// End by ingress
+
 	return ctx
 }
 
@@ -1022,6 +1060,9 @@ type gatewayListenerOpts struct {
 	port              *model.Port
 	filterChainOpts   []*filterChainOpts
 	needPROXYProtocol bool
+	// Added by ingress
+	enableProxyProtocol bool
+	// End added by ingress
 }
 
 // outboundListenerOpts are the options to build an outbound listener
@@ -1048,6 +1089,12 @@ func buildGatewayListener(opts gatewayListenerOpts, transport istionetworking.Tr
 		listenerFilters = append(listenerFilters, xdsfilters.ProxyProtocol)
 	}
 
+	// Added by ingress
+	if transport == istionetworking.TransportProtocolTCP && opts.enableProxyProtocol {
+		listenerFilters = append(listenerFilters, xdsfilters.ProxyProtocolInspector)
+	}
+	// End added by ingress
+
 	// add a TLS inspector if we need to detect ServerName or ALPN
 	// (this is not applicable for QUIC listeners)
 	if transport == istionetworking.TransportProtocolTCP {
@@ -1072,6 +1119,9 @@ func buildGatewayListener(opts gatewayListenerOpts, transport istionetworking.Tr
 		filterChains = append(filterChains, &listener.FilterChain{
 			FilterChainMatch: match,
 			TransportSocket:  transportSocket,
+			// Setting this timeout enables the gateway to enhance its resistance against memory exhaustion attacks,
+			// such as slow TLS Handshake attacks.
+			TransportSocketConnectTimeout: durationpb.New(defaultGatewayTransportSocketConnectTimeout),
 		})
 	}
 
@@ -1097,11 +1147,10 @@ func buildGatewayListener(opts gatewayListenerOpts, transport istionetworking.Tr
 			ListenerFilters:         listenerFilters,
 			FilterChains:            filterChains,
 			ConnectionBalanceConfig: connectionBalance,
-			// For Gateways, we want no timeout. We should wait indefinitely for the TLS if we are sniffing.
-			// The timeout is useful for sidecars, where we may operate on server first traffic; for gateways if we have listener filters
-			// we know those filters are required.
-			ContinueOnListenerFiltersTimeout: false,
-			ListenerFiltersTimeout:           durationpb.New(0),
+			// No listener filter timeout is set for the gateway here; it will default to 15 seconds in Envoy.
+			// This timeout setting helps prevent memory leaks in Envoy when a TLS inspector filter is present,
+			// by avoiding slow requests that could otherwise lead to such issues.
+			// Note that this timer only takes effect when a listener filter is present.
 		}
 		// add extra addresses for the listener
 		if features.EnableDualStack && len(opts.extraBind) > 0 {
@@ -1129,15 +1178,14 @@ func buildGatewayListener(opts gatewayListenerOpts, transport istionetworking.Tr
 				QuicOptions:            &listener.QuicProtocolOptions{},
 				DownstreamSocketConfig: &core.UdpSocketConfig{},
 			},
-			// For Gateways, we want no timeout. We should wait indefinitely for the TLS if we are sniffing.
-			// The timeout is useful for sidecars, where we may operate on server first traffic; for gateways if we have listener filters
-			// we know those filters are required.
-			ContinueOnListenerFiltersTimeout: false,
-			ListenerFiltersTimeout:           durationpb.New(0),
 		}
 		// add extra addresses for the listener
 		if features.EnableDualStack && len(opts.extraBind) > 0 {
 			res.AdditionalAddresses = util.BuildAdditionalAddresses(opts.extraBind, uint32(opts.port.Port))
+			// Ensure consistent transport protocol with main address
+			for _, additionalAddress := range res.AdditionalAddresses {
+				additionalAddress.GetAddress().GetSocketAddress().Protocol = transport.ToEnvoySocketProtocol()
+			}
 		}
 	}
 
